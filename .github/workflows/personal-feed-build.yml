@@ -1,0 +1,224 @@
+name: Personal Feed Build
+
+on:
+  workflow_call:
+    inputs:
+      matrix-include:
+        description: JSON string of the build matrix include list
+        required: true
+        type: string
+    secrets:
+      APK_PRIVATE_KEY:
+        description: Private (secret) key used to sign apk packages
+        required: false
+      OPKG_SECRET_KEY:
+        description: Secret (private) key used to sign opkg packages
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-slim
+    outputs:
+      matrix-include: ${{ steps.prepare-matrix-include.outputs.matrix-include }}
+
+    steps:
+      - name: Prepare build matrix include list
+        id: prepare-matrix-include
+        env:
+          include: ${{ inputs.matrix-include }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            branch="${GITHUB_BASE_REF#refs/heads/}"
+            case "$branch" in
+              main|master)
+                select='.branch == "main" or .branch == "master"'
+                ;;
+              *)
+                select=".branch == \"$branch\""
+                ;;
+            esac
+            include="$(echo "$include" | jq -c 'map(select('"$select"'))')"
+          else
+            include="$(echo "$include" | jq -c .)"
+          fi
+          echo "matrix-include=$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.branch }}-${{ matrix.arch }}
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix-include) }}
+
+    steps:
+      - name: Remove unused Android SDK, .NET, Swift, GHC
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+
+      - name: Check out ${{ matrix.branch }} branch
+        id: check-out-matrix-branch
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Check out default branch
+        if: steps.check-out-matrix-branch.outcome != 'success'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v11
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.branch }}
+          FEEDNAME: personal
+          INDEX: 1
+          KEY_BUILD: ${{ secrets.OPKG_SECRET_KEY }}
+          PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+          V: s
+
+      - name: Move created packages to project dir
+        if: ${{ !cancelled() }}
+        env:
+          arch: ${{ matrix.arch }}
+        run: cp -v bin/packages/$arch/personal/* . || true
+
+      - name: Collect metadata
+        id: collect-metadata
+        if: ${{ !cancelled() }}
+        env:
+          arch: ${{ matrix.arch }}
+          branch: ${{ matrix.branch }}
+        run: |
+          commit="$(git rev-parse --short HEAD)"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            pr="${GITHUB_REF_NAME%/merge}"
+            archive="$arch-PR$pr-$commit"
+          else
+            archive="$arch-$branch-$commit"
+          fi
+          echo "archive-name=$archive" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Generate metadata
+        if: ${{ !cancelled() }}
+        env:
+          arch: ${{ matrix.arch }}
+          archive: ${{ steps.collect-metadata.outputs.archive-name }}
+          branch: ${{ matrix.branch }}
+          commit: ${{ steps.collect-metadata.outputs.commit }}
+          pr: ${{ steps.collect-metadata.outputs.pr }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_id="$(git rev-parse --short HEAD^1)"
+            head_id="$(git rev-parse --short HEAD^2)"
+            homepage="pull/$pr"
+            description="Packages for OpenWrt $branch running on $arch, built from PR $pr at commit $head_id, against $branch at commit $base_id, with merge SHA $commit."
+          else
+            homepage="tree/$branch"
+            description="Packages for OpenWrt $branch running on $arch, built from $branch at commit $commit."
+          fi
+          cat << _EOF_ > PKG-INFO
+          Metadata-Version: 2.1
+          Name: $archive
+          Version: $branch
+          Author: $GITHUB_ACTOR
+          Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/$homepage
+          Download-URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Platform: $arch
+
+          $description
+
+          Full file listing:
+          _EOF_
+          ls -al *.ipk >> PKG-INFO || true
+          ls -al *.apk >> PKG-INFO || true
+          cat PKG-INFO
+
+      - name: Store packages
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect-metadata.outputs.archive-name }}-packages
+          path: |
+            Packages
+            Packages.*
+            *.ipk
+            packages.adb
+            *.apk
+            PKG-INFO
+
+      - name: Store logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect-metadata.outputs.archive-name }}-logs
+          path: |
+            logs/
+            PKG-INFO
+
+      - name: Remove logs
+        if: ${{ !cancelled() }}
+        run: sudo rm -rf logs/ || true
+
+  deploy:
+    name: Deploy
+    needs: [setup, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-slim
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy-feed.outputs.page_url }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: packages
+          pattern: '*-packages'
+
+      - name: Set up feed structure
+        env:
+          include: ${{ needs.setup.outputs.matrix-include }}
+        run: |
+          mkdir feed
+          echo "$include" |
+            jq -r 'map(.branch + "|" + .arch) | @sh' |
+            tr -d "'" | tr ' ' '\n' |
+            while IFS="|" read -r branch arch; do
+              dir="$(find packages -mindepth 1 -maxdepth 1 -name "$arch-$branch-*" -type d -not -empty -print -quit)"
+              if [ -n "$dir" ]; then
+                mkdir -p "feed/$branch"
+                mv "$dir" "feed/$branch/$arch"
+              fi
+            done
+          if [ -z "$(find feed -maxdepth 0 -not -empty -print -quit)" ]; then
+            echo "No packages found"
+            exit 1
+          fi
+
+      - name: Store feed
+        uses: actions/upload-pages-artifact@v5
+        with:
+          name: feed-${{ github.run_attempt }}
+          path: feed
+
+      - name: Deploy feed
+        id: deploy-feed
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: feed-${{ github.run_attempt }}
